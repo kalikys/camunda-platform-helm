@@ -47,17 +47,18 @@ type MetricsSource interface {
 }
 
 type Status struct {
-	ObservedAt       time.Time          `json:"observedAt"`
-	Mode             string             `json:"mode"`
-	Phase            string             `json:"phase"`
-	Reason           string             `json:"reason"`
-	CurrentBrokers   int                `json:"currentBrokers"`
-	DesiredBrokers   int                `json:"desiredBrokers"`
-	WorkloadReplicas int                `json:"workloadReplicas"`
-	Signals          map[string]float64 `json:"signals,omitempty"`
-	LastChange       *CapacityChange    `json:"lastChange,omitempty"`
-	Confidence       string             `json:"confidence"`
-	LastError        string             `json:"lastError,omitempty"`
+	ObservedAt       time.Time               `json:"observedAt"`
+	Mode             string                  `json:"mode"`
+	Phase            string                  `json:"phase"`
+	Reason           string                  `json:"reason"`
+	CurrentBrokers   int                     `json:"currentBrokers"`
+	DesiredBrokers   int                     `json:"desiredBrokers"`
+	WorkloadReplicas int                     `json:"workloadReplicas"`
+	Signals          map[string]float64      `json:"signals,omitempty"`
+	LastChange       *CapacityChange         `json:"lastChange,omitempty"`
+	PartitionAdvisor PartitionRecommendation `json:"partitionAdvisor"`
+	Confidence       string                  `json:"confidence"`
+	LastError        string                  `json:"lastError,omitempty"`
 }
 
 // CapacityChange records the most recent decision that started a broker
@@ -85,6 +86,7 @@ type Manager struct {
 	Namespace     string
 	StatefulSet   string
 	Planner       *Planner
+	Advisor       *PartitionAdvisor
 	Logger        *slog.Logger
 	OperationWait time.Duration
 	OperationPoll time.Duration
@@ -122,6 +124,9 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 	}
 	current := topology.ActiveBrokerCount()
 	status := Status{ObservedAt: time.Now().UTC(), Mode: policy.Mode, Phase: "observing", CurrentBrokers: current, DesiredBrokers: workload.Target, WorkloadReplicas: workload.Replicas, Confidence: "high"}
+	if m.Advisor != nil {
+		status.PartitionAdvisor = m.Advisor.Advise(policy.PartitionAdvisor, topology, m.partitionLoad(ctx, policy, current))
+	}
 	if topology.PendingChange != nil {
 		status.Phase = "blocked"
 		status.Reason = fmt.Sprintf("topology change %d is %s", topology.PendingChange.ID, topology.PendingChange.Status)
@@ -131,6 +136,15 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 	if !topology.Healthy() {
 		status.Phase = "blocked"
 		status.Reason = "cluster topology is not healthy"
+		m.setStatus(status)
+		return nil
+	}
+	if policy.Mode == "recommend" {
+		// Recommend mode is read-only: it never repairs or changes the
+		// workload, so advisor-only deployments keep plain Helm ownership.
+		status.Phase = "recommended"
+		status.Reason = "broker autoscaling disabled"
+		status.DesiredBrokers = current
 		m.setStatus(status)
 		return nil
 	}
@@ -164,12 +178,6 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 	status.Reason = decision.Reason
 	status.Signals = decision.Signals
 	status.Confidence = decision.Confidence
-	if policy.Mode == "recommend" {
-		status.Phase = "recommended"
-		m.setStatus(status)
-		return nil
-	}
-
 	if decision.Desired == current {
 		status.Phase = "stable"
 		m.setStatus(status)
@@ -219,12 +227,29 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 
 // readSignals queries every policy signal. A failed query is recorded as
 // missing data so the planner holds instead of acting on partial evidence.
+func (m *Manager) placeholders(current int) *strings.Replacer {
+	return strings.NewReplacer("$BROKERS", strconv.Itoa(current), "$NAMESPACE", m.Namespace, "$STATEFULSET", m.StatefulSet)
+}
+
+// partitionLoad reads the advisor's load query; nil means no evidence.
+func (m *Manager) partitionLoad(ctx context.Context, policy Policy, current int) *float64 {
+	if !policy.PartitionAdvisor.Enabled || m.Metrics == nil {
+		return nil
+	}
+	value, err := m.Metrics.Query(ctx, m.placeholders(current).Replace(policy.PartitionAdvisor.LoadQuery))
+	if err != nil {
+		m.Logger.Warn("partition advisor query failed", "error", err)
+		return nil
+	}
+	return value
+}
+
 func (m *Manager) readSignals(ctx context.Context, policy Policy, current int) map[string]*float64 {
 	readings := map[string]*float64{}
 	if policy.Mode != "automatic" || m.Metrics == nil {
 		return readings
 	}
-	placeholders := strings.NewReplacer("$BROKERS", strconv.Itoa(current), "$NAMESPACE", m.Namespace, "$STATEFULSET", m.StatefulSet)
+	placeholders := m.placeholders(current)
 	for _, group := range [][]Signal{policy.VetoSignals, policy.ScaleUpSignals, policy.ScaleDownSignals} {
 		for _, signal := range group {
 			value, err := m.Metrics.Query(ctx, placeholders.Replace(signal.Query))
